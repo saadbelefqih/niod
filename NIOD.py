@@ -1,0 +1,1064 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Dense, Dropout, Input, Lambda
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.cluster import KMeans
+from sklearn.tree import DecisionTreeClassifier, export_text
+from sklearn.ensemble import BaggingClassifier
+from sklearn.metrics import (
+    confusion_matrix, classification_report,
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_curve, auc
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+import random
+import time
+import os
+import math
+
+
+def load_diabetes_dataset(file_path=None, sample_size=None, random_state=42,
+                          reduced_dim=16, embed_dim=8):
+    """
+    Load and preprocess, the Pima Indians Diabetes dataset.
+
+    If file_path is None, the function expects you to provide a CSV path.
+    The CSV must contain a binary column named Outcome.
+    """
+
+
+def load_kddcup99_dataset(sample_size=10000, random_state=42,
+                          reduced_dim=32, embed_dim=16):
+    """
+    Load and preprocess the KDDCup99 dataset.
+
+    """
+# ==================== CUSTOM LAYERS ====================
+
+class CentroidLayer(tf.keras.layers.Layer):
+    """
+    Computes distances from embeddings to two centroids.
+    Implements d(E_i, mu_j) = ||E_i - mu_j||^2
+
+    Keeps two centroids as trainable weights.
+    """
+    def __init__(self, input_shape_val, initial_centroid_0=None, initial_centroid_1=None, **kwargs):
+        super(CentroidLayer, self).__init__(**kwargs)
+        self.input_shape_val = input_shape_val
+        self.initial_centroid_0_val = initial_centroid_0
+        self.initial_centroid_1_val = initial_centroid_1
+
+        # Centroid 0 (normal like)
+        if initial_centroid_0 is not None:
+            self.centroid_0 = self.add_weight(
+                shape=(input_shape_val,),
+                initializer=tf.keras.initializers.Constant(initial_centroid_0),
+                trainable=True,
+                name='centroid_0'
+            )
+            self.initial_centroid_0_const = self.add_weight(
+                shape=(input_shape_val,),
+                initializer=tf.keras.initializers.Constant(initial_centroid_0),
+                trainable=False,
+                name='initial_centroid_0'
+            )
+        else:
+            self.centroid_0 = self.add_weight(
+                shape=(input_shape_val,),
+                initializer='zeros',
+                trainable=True,
+                name='centroid_0'
+            )
+            self.initial_centroid_0_const = self.add_weight(
+                shape=(input_shape_val,),
+                initializer='zeros',
+                trainable=False,
+                name='initial_centroid_0'
+            )
+
+        # Centroid 1 (outlier like)
+        if initial_centroid_1 is not None:
+            self.centroid_1 = self.add_weight(
+                shape=(input_shape_val,),
+                initializer=tf.keras.initializers.Constant(initial_centroid_1),
+                trainable=True,
+                name='centroid_1'
+            )
+            self.initial_centroid_1_const = self.add_weight(
+                shape=(input_shape_val,),
+                initializer=tf.keras.initializers.Constant(initial_centroid_1),
+                trainable=False,
+                name='initial_centroid_1'
+            )
+        else:
+            self.centroid_1 = self.add_weight(
+                shape=(input_shape_val,),
+                initializer='zeros',
+                trainable=True,
+                name='centroid_1'
+            )
+            self.initial_centroid_1_const = self.add_weight(
+                shape=(input_shape_val,),
+                initializer='zeros',
+                trainable=False,
+                name='initial_centroid_1'
+            )
+
+    def call(self, inputs):
+        """
+        Compute squared Euclidean distances to both centroids.
+        Distances are always non negative.
+        """
+        inputs = tf.cast(inputs, dtype=self.centroid_0.dtype)
+
+        # Distance to centroid 0 (normal like)
+        distance_0 = tf.reduce_sum(tf.square(inputs - self.centroid_0), axis=-1, keepdims=True)
+
+        # Distance to centroid 1 (outlier like)
+        distance_1 = tf.reduce_sum(tf.square(inputs - self.centroid_1), axis=-1, keepdims=True)
+
+        # Return both distances concatenated
+        return tf.concat([distance_0, distance_1], axis=-1)
+
+    def get_centroids(self):
+        """Return both centroids as numpy arrays"""
+        return (self.centroid_0.numpy() if self.centroid_0 is not None else None,
+                self.centroid_1.numpy() if self.centroid_1 is not None else None)
+
+
+class ConfidenceWeightedVotingLayer(tf.keras.layers.Layer):
+    """
+    Confidence Weighted Voting Layer
+
+    Aggregates predictions from an ensemble of soft decision trees using
+    entropy normalized weights.
+
+    Input
+        tree_predictions: shape (batch_size, n_trees, n_classes)
+
+    Output
+        weighted_predictions: shape (batch_size, n_classes)
+    """
+    def __init__(self, n_trees=3, n_classes=2, **kwargs):
+        super(ConfidenceWeightedVotingLayer, self).__init__(**kwargs)
+        self.n_trees = n_trees
+        self.n_classes = n_classes
+        self.epsilon = 1e-10  # Numerical stability
+
+    def build(self, input_shape):
+        """
+        Input shape: (batch_size, n_trees, n_classes)
+        """
+        if len(input_shape) != 3:
+            raise ValueError(
+                "ConfidenceWeightedVotingLayer expects input of shape "
+                "(batch_size, n_trees, n_classes)"
+            )
+
+        inferred_n_trees = input_shape[1]
+        inferred_n_classes = input_shape[2]
+
+        if inferred_n_trees is not None:
+            self.n_trees = int(inferred_n_trees)
+        if inferred_n_classes is not None:
+            self.n_classes = int(inferred_n_classes)
+
+        super(ConfidenceWeightedVotingLayer, self).build(input_shape)
+
+    def call(self, tree_predictions, **kwargs):
+        """
+        tree_predictions shape (batch_size, n_trees, n_classes)
+
+        Returns
+        weighted_predictions shape (batch_size, n_classes)
+        """
+        # Entropy per tree: H_m = - sum p(c) log p(c)
+        entropies = -tf.reduce_sum(
+            tree_predictions * tf.math.log(tree_predictions + self.epsilon),
+            axis=-1
+        )  # (batch_size, n_trees)
+
+        # Confidence weights: w_m = 1 - H_m / log(|C|)
+        max_entropy = tf.math.log(
+            tf.cast(self.n_classes, tf.float32) + self.epsilon
+        )  # scalar
+
+        raw_weights = 1.0 - (entropies / (max_entropy + self.epsilon))
+
+        # Normalize weights over trees per sample
+        weight_sum = tf.reduce_sum(raw_weights, axis=-1, keepdims=True) + self.epsilon
+        norm_weights = raw_weights / weight_sum  # (batch_size, n_trees)
+
+        # Broadcast weights back to (batch_size, n_trees, n_classes)
+        norm_weights_expanded = tf.expand_dims(norm_weights, axis=-1)
+
+        # Weighted sum of per tree probability vectors
+        weighted_tree_outputs = norm_weights_expanded * tree_predictions
+
+        # Sum across trees to get final prob per class
+        weighted_predictions = tf.reduce_sum(weighted_tree_outputs, axis=1)
+
+        return weighted_predictions
+
+    def get_config(self):
+        config = super(ConfidenceWeightedVotingLayer, self).get_config()
+        config.update({
+            'n_trees': self.n_trees,
+            'n_classes': self.n_classes
+        })
+        return config
+
+
+class DecisionTreeLayer(tf.keras.layers.Layer):
+    """
+    Differentiable soft decision tree
+
+    Each internal node computes a soft split:
+        sigma(w_j^T F_tree + b_j)
+
+    Each leaf node predicts class logits, then applies softmax
+    """
+    def __init__(self, depth=3, n_classes=2, **kwargs):
+        super(DecisionTreeLayer, self).__init__(**kwargs)
+        self.depth = depth
+        self.n_classes = n_classes
+        self.n_internal_nodes = 2**depth - 1
+        self.n_leaf_nodes = 2**depth
+
+    def build(self, input_shape):
+        feature_dim = input_shape[-1]
+
+        # Internal node split params
+        self.split_weights = self.add_weight(
+            name='split_weights',
+            shape=(self.n_internal_nodes, feature_dim),
+            initializer='glorot_uniform',
+            trainable=True
+        )
+        self.split_biases = self.add_weight(
+            name='split_biases',
+            shape=(self.n_internal_nodes,),
+            initializer='zeros',
+            trainable=True
+        )
+
+        # Leaf node class logits params
+        self.leaf_weights = self.add_weight(
+            name='leaf_weights',
+            shape=(self.n_leaf_nodes, feature_dim, self.n_classes),
+            initializer='glorot_uniform',
+            trainable=True
+        )
+        self.leaf_biases = self.add_weight(
+            name='leaf_biases',
+            shape=(self.n_leaf_nodes, self.n_classes),
+            initializer='zeros',
+            trainable=True
+        )
+
+        super(DecisionTreeLayer, self).build(input_shape)
+
+    def call(self, inputs):
+        batch_size = tf.shape(inputs)[0]
+
+        # Start with probability 1 at root for each sample
+        path_probs = tf.ones((batch_size, 1), dtype=tf.float32)
+
+        # Soft routing through tree levels
+        for level in range(self.depth):
+            level_nodes = range(2**level - 1, 2**(level+1) - 1)
+            new_path_probs = []
+
+            for node_idx in level_nodes:
+                # sigma(w_j^T x + b_j)
+                split_logit = tf.matmul(
+                    inputs,
+                    tf.expand_dims(self.split_weights[node_idx], -1)
+                )
+                split_logit = tf.squeeze(split_logit, -1) + self.split_biases[node_idx]
+                split_prob = tf.nn.sigmoid(split_logit)  # in [0,1]
+                split_prob = tf.expand_dims(split_prob, -1)
+
+                # Which column of path_probs corresponds to current node
+                current_idx = node_idx - (2**level - 1)
+                current_path_prob = path_probs[:, current_idx:current_idx+1]
+
+                # Left child = (1 - p), Right child = p
+                left_prob = current_path_prob * (1 - split_prob)
+                right_prob = current_path_prob * split_prob
+
+                new_path_probs.extend([left_prob, right_prob])
+
+            # Stack probs for nodes in next level
+            path_probs = tf.concat(new_path_probs, axis=1)
+
+        # Leaf predictions
+        # For each leaf k, class logits = W_k^T x + b_k
+        leaf_logits = tf.einsum('bi,lij->blj', inputs, self.leaf_weights) + self.leaf_biases
+
+        # Convert to softmax per leaf
+        leaf_probs = tf.nn.softmax(leaf_logits, axis=-1)  # (batch, n_leaf_nodes, n_classes)
+
+        # Weight leaf preds by path prob that reaches each leaf
+        path_probs_expanded = tf.expand_dims(path_probs, -1)  # (batch, n_leaf_nodes, 1)
+        tree_output = tf.reduce_sum(path_probs_expanded * leaf_probs, axis=1)
+        # tree_output is (batch, n_classes)
+
+        return tree_output
+
+
+class EpochTimingCallback(tf.keras.callbacks.Callback):
+    """
+    Keras callback that measures per epoch wall clock time.
+    It stores epoch times in model_wrapper.epoch_times
+    """
+    def __init__(self, model_wrapper):
+        super().__init__()
+        self.model_wrapper = model_wrapper
+        self.epoch_start_time = None
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.epoch_start_time = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        elapsed = time.time() - self.epoch_start_time
+        self.model_wrapper.epoch_times.append(elapsed)
+        print(f"[Timing] Epoch {epoch} took {elapsed:.3f} sec")
+
+
+# ==================== MAIN MODEL ==================== 
+
+class NeuralInterpretableOutlierDetectionModel:
+    """
+    Neural Interpretable Outlier Detection (NIOD) Framework
+
+    Pipeline
+      1. Linear compression via dimensionality reduction layers
+      2. Embedding layer with tanh
+      3. Dual centroid distance layer
+      4. Per tree soft decision trees over [X concat d_to_centroid0 concat d_to_centroid1]
+      5. Confidence weighted voting
+      6. Output probability distribution over {normal, outlier}
+    """
+    def __init__(self, input_shape, n_components=10, embedding_dim=8, n_centroids=2,
+                 tree_max_depth=4, n_trees=3, distance_percentile=75,
+                 training=False, seed=42):
+        self.input_shape = input_shape
+        self.n_components = n_components
+        self.embedding_dim = embedding_dim
+        self.n_centroids = n_centroids
+        self.tree_max_depth = tree_max_depth
+        self.n_trees = n_trees
+        self.distance_percentile = distance_percentile
+        self.scaler = StandardScaler()
+        self.seed = seed
+        self.training = training
+        self.dropout_rate = 0.2 if training else 0.0
+        self.n_classes = 2
+        self.target_pos_rate = 0.5
+
+        # For timing
+        self.epoch_times = []
+        self.total_fit_start = None
+        self.total_fit_end = None
+
+        # Reproducibility
+        tf.random.set_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        tf.keras.utils.set_random_seed(seed)
+
+        self.model, self.dim_reduction_model, self.embedding_model = self.build_model()
+
+    def build_model(self):
+        """Build NIOD architecture"""
+        inputs = Input(shape=self.input_shape, name="input_layer")
+
+        # Dimensionality Reduction
+        x = Dense(
+            self.n_components,
+            activation='relu',
+            name='dim_reduction_1',
+            kernel_initializer=tf.keras.initializers.GlorotUniform(seed=self.seed)
+        )(inputs)
+        x = Dropout(self.dropout_rate, seed=self.seed)(x, training=self.training)
+        x = Dense(
+            self.n_components // 2,
+            activation='relu',
+            name='dim_reduction_2',
+            kernel_initializer=tf.keras.initializers.GlorotUniform(seed=self.seed)
+        )(x)
+
+        # Embedding
+        e = Dense(
+            self.embedding_dim,
+            activation='tanh',
+            name='embedding_1',
+            kernel_initializer=tf.keras.initializers.GlorotUniform(seed=self.seed)
+        )(x)
+        e = Dropout(self.dropout_rate, seed=self.seed)(e, training=self.training)
+        e = Dense(
+            self.embedding_dim // 2,
+            activation='tanh',
+            name='embedding_2',
+            kernel_initializer=tf.keras.initializers.GlorotUniform(seed=self.seed)
+        )(e)
+
+        # Dual centroid distance layer
+        self.centroid_layer = CentroidLayer(input_shape_val=e.shape[-1])
+        distances = self.centroid_layer(e)  # shape (batch, 2)
+
+        # Concatenate original input + centroid distances
+        tree_features = tf.keras.layers.Concatenate(name='tree_features')([
+            inputs,
+            distances
+        ])
+
+        # Soft decision tree ensemble
+        tree_outputs = []
+        for i in range(self.n_trees):
+            tree = DecisionTreeLayer(
+                depth=self.tree_max_depth,
+                n_classes=self.n_classes,
+                name=f'decision_tree_{i}'
+            )(tree_features)
+            tree_outputs.append(tree)
+
+        # Stack trees along axis = 1 -> (batch, n_trees, n_classes)
+        stacked_trees = Lambda(
+            lambda x: tf.stack(x, axis=1),
+            name='stack_trees'
+        )(tree_outputs)
+
+        # Confidence weighted voting
+        self.voting_layer = ConfidenceWeightedVotingLayer(
+            n_trees=self.n_trees,
+            n_classes=self.n_classes,
+            name='confidence_weighted_voting'
+        )
+        aggregated_output = self.voting_layer(stacked_trees)
+
+        output = aggregated_output  # already probabilities
+
+        main_model = Model(inputs=inputs, outputs=output, name="NIOD_Model")
+
+        # Custom loss with centroid regularization and class balance
+        def custom_loss(y_true, y_pred):
+            # y_true: (batch,) int {0,1}
+            # y_pred: (batch,2) probabilities
+
+            # Prepare labels
+            y_true = tf.reshape(y_true, [-1])
+            y_true = tf.cast(y_true, tf.int32)
+            y_true_onehot = tf.one_hot(y_true, depth=self.n_classes, dtype=tf.float32)
+
+            # Label smoothing
+            label_smoothing = 0.1
+            y_true_smooth = (
+                y_true_onehot * (1 - label_smoothing)
+                + (1.0 / self.n_classes) * label_smoothing
+            )
+
+            # Cross entropy
+            y_pred_clipped = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+            cce = -tf.reduce_sum(y_true_smooth * tf.math.log(y_pred_clipped), axis=-1)
+            cce = tf.reduce_mean(cce)
+
+            # Centroid separation regularization
+            centroid_separation = tf.reduce_sum(
+                tf.square(self.centroid_layer.centroid_0 - self.centroid_layer.centroid_1)
+            )
+            sep_weight = 0.1
+            centroid_sep_term = sep_weight * (-centroid_separation)
+
+            # Class balance regularization
+            pred_class_1 = y_pred[:, 1]
+            class_balance_weight = 0.0  # can be tuned
+            class_balance_term = class_balance_weight * tf.square(
+                tf.reduce_mean(pred_class_1) - tf.cast(self.target_pos_rate, tf.float32)
+            )
+
+            return cce + centroid_sep_term + class_balance_term
+
+        main_model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005),
+            loss=custom_loss,
+            metrics=['accuracy']
+        )
+
+        dim_reduction_model = Model(
+            inputs=inputs,
+            outputs=x,
+            name="Dimensionality_Reduction_Model"
+        )
+        embedding_model = Model(
+            inputs=x,
+            outputs=e,
+            name="Embedding_Model"
+        )
+
+        return main_model, dim_reduction_model, embedding_model
+
+    def fit(self, X, epochs=100, batch_size=32, validation_split=0.2):
+        """
+        Train NIOD
+          1. Initialize centroids using k means in embedding space
+          2. Generate pseudo labels (minority cluster is outlier)
+          3. Train soft trees end to end
+          4. Track timing per epoch and total wall time
+        """
+        X_scaled = X
+
+        # Generate embeddings for centroid initialization
+        reduced_features = self.dim_reduction_model.predict(X_scaled, verbose=0)
+        embedding_features = self.embedding_model.predict(reduced_features, verbose=0)
+
+        # Init centroids with KMeans
+        kmeans = KMeans(n_clusters=2, random_state=self.seed, n_init=10)
+        cluster_labels = kmeans.fit_predict(embedding_features)
+        centroid_0 = kmeans.cluster_centers_[0]
+        centroid_1 = kmeans.cluster_centers_[1]
+
+        print(f"\nInitial centroid 0: {centroid_0}")
+        print(f"Initial centroid 1: {centroid_1}")
+        print(f"Centroid separation (L2): {np.linalg.norm(centroid_0 - centroid_1):.4f}")
+
+        # Assign centroids to layer
+        self.centroid_layer.centroid_0.assign(centroid_0)
+        self.centroid_layer.centroid_1.assign(centroid_1)
+        self.centroid_layer.initial_centroid_0_const.assign(centroid_0)
+        self.centroid_layer.initial_centroid_1_const.assign(centroid_1)
+
+        # Generate pseudo labels (minority cluster -> outlier = 1)
+        counts = np.bincount(cluster_labels, minlength=2)
+        outlier_id = np.argmin(counts)
+        binary_labels = (cluster_labels == outlier_id).astype(int)
+
+        print(f"Pseudo label distribution: {np.bincount(binary_labels)}")
+
+        # Deterministic split for validation
+        n_samples = len(X_scaled)
+        n_val = int(n_samples * validation_split)
+
+        indices = np.arange(n_samples)
+        np.random.seed(self.seed)
+        np.random.shuffle(indices)
+
+        val_indices = indices[:n_val]
+        train_indices = indices[n_val:]
+
+        X_train_split = X_scaled[train_indices]
+        y_train_split = binary_labels[train_indices]
+        X_val_split = X_scaled[val_indices]
+        y_val_split = binary_labels[val_indices]
+
+        # Update target_pos_rate for loss regularizer
+        self.target_pos_rate = float(np.mean(y_train_split))
+
+        # Build timing and training callbacks
+        timing_cb = EpochTimingCallback(self)
+        early_stop_cb = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=15,
+            restore_best_weights=True
+        )
+        reduce_lr_cb = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.2,
+            patience=10,
+            min_lr=1e-5
+        )
+
+        # Train model and measure wall time
+        self.total_fit_start = time.time()
+        history = self.model.fit(
+            X_train_split, y_train_split,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(X_val_split, y_val_split),
+            callbacks=[timing_cb, early_stop_cb, reduce_lr_cb],
+            verbose=1,
+            shuffle=False
+        )
+        self.total_fit_end = time.time()
+
+        # Also train a classical tree ensemble for hard split inspection
+        # Build centroid distance features for each sample
+        dist0 = np.sum((embedding_features - centroid_0)**2, axis=1, keepdims=True)
+        dist1 = np.sum((embedding_features - centroid_1)**2, axis=1, keepdims=True)
+        tree_features_np = np.concatenate([X_scaled, dist0, dist1], axis=1)
+
+        self.tree_classifier = BaggingClassifier(
+            estimator=DecisionTreeClassifier(
+                max_depth=self.tree_max_depth,
+                random_state=self.seed
+            ),
+            n_estimators=self.n_trees,
+            random_state=self.seed
+        )
+        self.tree_classifier.fit(tree_features_np, binary_labels)
+
+        return history
+
+    def get_training_time_report(self):
+        """
+        Return timing info as a dictionary
+          mean seconds per epoch
+          total wall time for model.fit
+          list of all epoch times
+        """
+        epoch_times_arr = np.array(self.epoch_times, dtype=float)
+        if (
+            len(epoch_times_arr) == 0
+            or self.total_fit_start is None
+            or self.total_fit_end is None
+        ):
+            return {
+                "mean_epoch_time_sec": None,
+                "total_training_time_sec": None,
+                "epoch_times": []
+            }
+        return {
+            "mean_epoch_time_sec": float(np.mean(epoch_times_arr)),
+            "total_training_time_sec": float(self.total_fit_end - self.total_fit_start),
+            "epoch_times": epoch_times_arr.tolist()
+        }
+
+    def calibrate_threshold(self, X_val, y_val, metric='f1'):
+        proba = self.predict_proba(X_val)[:, 1]
+        ts = np.linspace(0.01, 0.99, 99)
+
+        if metric == 'f1':
+            scores = [f1_score(y_val, (proba >= t).astype(int)) for t in ts]
+        else:
+            scores = []
+            for t in ts:
+                yhat = (proba >= t).astype(int)
+                pr = precision_score(y_val, yhat)
+                rc = recall_score(y_val, yhat)
+                scores.append(2 * pr * rc / (pr + rc + 1e-9))
+
+        self.decision_threshold_ = float(ts[int(np.argmax(scores))])
+
+    def predict(self, X):
+        """
+        Get binary predictions using calibrated threshold
+        """
+        probs = self.model.predict(X, verbose=0)
+        thr = getattr(self, "decision_threshold_", 0.75)
+        return (probs[:, 1] > thr).astype(int).reshape(-1, 1)
+
+    def predict_proba(self, X):
+        """Get class probabilities from NIOD model"""
+        return self.model.predict(X, verbose=0)
+
+    def get_centroids(self):
+        """Get learned centroids"""
+        return self.centroid_layer.get_centroids()
+
+    def evaluate_performance(self, X_test, y_true, dataset_name="Dataset"):
+        """
+        Evaluate model performance and generate diagnostic plots
+        """
+        y_true = y_true.astype(int).ravel()
+        prediction = self.predict(X_test).ravel()
+        proba = self.predict_proba(X_test)
+
+        print(f"\n{'='*60}")
+        print(f"Evaluation Results for {dataset_name}")
+        print(f"{'='*60}")
+
+        # Metrics
+        acc = accuracy_score(y_true, prediction)
+        prec = precision_score(y_true, prediction, zero_division=0)
+        rec = recall_score(y_true, prediction, zero_division=0)
+        f1 = f1_score(y_true, prediction, zero_division=0)
+
+        # Classification report
+        report = classification_report(
+            y_true,
+            prediction,
+            target_names=['Normal', 'Outlier'],
+            output_dict=True,
+            zero_division=0
+        )
+
+        # 1. Metrics bar plot
+        plt.figure(figsize=(10, 6))
+        metrics = ['Accuracy', 'Precision', 'Recall', 'F1-Score']
+        values = [acc, prec, rec, f1]
+        colors = ['#2ecc71', '#3498db', '#e74c3c', '#f1c40f']
+
+        plt.bar(metrics, values, color=colors)
+        plt.ylim(0, 1)
+        plt.title(f'{dataset_name} - Model Performance Metrics',
+                  pad=20, fontsize=14, fontweight='bold')
+        plt.ylabel('Score', fontsize=12)
+        plt.grid(True, alpha=0.3, axis='y')
+
+        for i, (metric, value) in enumerate(zip(metrics, values)):
+            plt.text(i, value + 0.02, f'{value:.3f}',
+                     ha='center', va='bottom',
+                     fontsize=10, fontweight='bold')
+
+        plt.tight_layout()
+        plt.show()
+
+        # 2. Per class metrics printout
+        df_report = pd.DataFrame(report).transpose()
+        print(f"\nPer Class Metrics for {dataset_name}:")
+        print(df_report)
+
+        # 3. Confusion matrix
+        fig, ax = plt.subplots(figsize=(8, 6))
+        cm = confusion_matrix(y_true, prediction)
+        sns.heatmap(
+            cm,
+            annot=True,
+            fmt='d',
+            cmap='Blues',
+            ax=ax,
+            xticklabels=['Normal', 'Outlier'],
+            yticklabels=['Normal', 'Outlier']
+        )
+        plt.title(f'{dataset_name} - Confusion Matrix',
+                  fontsize=14, fontweight='bold')
+        plt.xlabel('Predicted', fontsize=12)
+        plt.ylabel('True', fontsize=12)
+        plt.tight_layout()
+        plt.show()
+
+        # 4. ROC curve using outlier probability
+        outlier_scores = proba[:, 1]  # Probability of outlier class
+
+        fpr, tpr, _ = roc_curve(y_true, outlier_scores)
+        roc_auc = auc(fpr, tpr)
+
+        plt.figure(figsize=(8, 6))
+        plt.plot(fpr, tpr, color='darkorange', lw=2,
+                 label=f'ROC curve (AUC = {roc_auc:.3f})')
+        plt.plot([0, 1], [0, 1], color='navy', lw=2,
+                 linestyle='--', label='Random')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('False Positive Rate', fontsize=12)
+        plt.ylabel('True Positive Rate', fontsize=12)
+        plt.title(f'{dataset_name} - ROC Curve',
+                  fontsize=14, fontweight='bold')
+        plt.legend(loc="lower right")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+
+        # 5. Class distribution pie
+        plt.figure(figsize=(8, 6))
+        class_counts = np.bincount(y_true.astype(int))
+        class_percentages = class_counts / len(y_true) * 100
+        plt.pie(
+            class_percentages,
+            labels=['Normal', 'Outlier'],
+            autopct='%1.1f%%',
+            colors=['#3498db', '#e74c3c'],
+            startangle=90
+        )
+        plt.title(f'{dataset_name} - Class Distribution',
+                  fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+
+        return {
+            'accuracy': acc,
+            'precision': prec,
+            'recall': rec,
+            'f1_score': f1,
+            'auc': roc_auc
+        }
+
+    def extract_decision_tree_rules(self, feature_names, max_depth_display=3):
+        """
+        Fit a standard CART style decision tree on NIOD derived features
+        and export human readable rules.
+
+        Steps
+        1. Rebuild NIOD feature space for each training point:
+           original scaled features concat
+           squared distance to centroid 0 concat
+           squared distance to centroid 1
+        2. Train a DecisionTreeClassifier with max_depth_display
+        3. Use sklearn export_text to get IF THEN style rules
+        """
+        # We expect run_experiment to cache training data after fit
+        if not hasattr(self, "X_fit_cached") or not hasattr(self, "y_fit_cached"):
+            print("Rule extraction skipped because cached training data is missing.")
+            return None
+
+        X_used = self.X_fit_cached
+        y_used = self.y_fit_cached
+
+        # Project training data to embedding to compute centroid distances
+        reduced_features = self.dim_reduction_model.predict(X_used, verbose=0)
+        embedding_features = self.embedding_model.predict(reduced_features, verbose=0)
+
+        c0, c1 = self.get_centroids()
+        dist0 = np.sum((embedding_features - c0)**2, axis=1, keepdims=True)
+        dist1 = np.sum((embedding_features - c1)**2, axis=1, keepdims=True)
+
+        F_tree = np.concatenate([X_used, dist0, dist1], axis=1)
+
+        # Extended feature names
+        extended_feature_names = feature_names + ["d(E_i, C_0)", "d(E_i, C_1)"]
+
+        # Train a standard hard decision tree
+        cart = DecisionTreeClassifier(
+            max_depth=max_depth_display,
+            random_state=self.seed
+        )
+        cart.fit(F_tree, y_used)
+
+        rules_text = export_text(cart, feature_names=extended_feature_names)
+        print("\nExtracted CART style hard rules (approximation of NIOD logic):")
+        print(rules_text)
+        return rules_text
+
+
+# ==================== HIGH LEVEL WORKFLOW ====================
+
+def run_experiment(dataset_type='diabetes', diabetes_path=None):
+    """
+    Run NIOD experiment on a chosen dataset and report
+      performance
+      learned rules
+      timing (per epoch, training total, pipeline total)
+    """
+    experiment_start = time.time()
+
+    print("\n" + "="*60)
+    print("NIOD - Neural Interpretable Outlier Detection")
+    print(f"Experiment: {dataset_type.upper()} Dataset")
+    print("="*60)
+
+    # Load dataset
+    if dataset_type == 'diabetes':
+        X, y, feature_names = load_diabetes_dataset(
+            file_path=diabetes_path,
+            sample_size=None,
+            random_state=42,
+            reduced_dim=16,
+            embed_dim=8
+        )
+        if X is None:
+            return None
+    elif dataset_type == 'kddcup99':
+        X, y, feature_names = load_kddcup99_dataset(sample_size=10000)
+        if X is None:
+            return None
+    else:
+        raise ValueError("dataset_type must be 'diabetes' or 'kddcup99'")
+
+    # Train test split FIRST
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Then fit scaler ONLY on training
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test  = scaler.transform(X_test)
+
+    print(f"\nTrain set size: {X_train.shape[0]}")
+    print(f"Test set size: {X_test.shape[0]}")
+
+    # Initialize NIOD model
+    model = NeuralInterpretableOutlierDetectionModel(
+        input_shape=(X_train.shape[1],),
+        n_components=X_train.shape[1],  # keep same dimension for stability
+        embedding_dim=8,
+        n_centroids=2,
+        tree_max_depth=3,
+        n_trees=3,
+        distance_percentile=75,
+        seed=42
+    )
+
+    # Train NIOD
+    print(f"\nTraining NIOD model on {dataset_type} dataset...")
+    history = model.fit(
+        X_train,
+        epochs=30,
+        batch_size=128,
+        validation_split=0.2
+    )
+
+    # Cache training data for rule extraction
+    model.X_fit_cached = X_train
+    model.y_fit_cached = y_train
+
+    # Calibrate threshold using a calibration fold from train
+    X_cal, X_hold, y_cal, _ = train_test_split(
+        X_train, y_train,
+        test_size=0.8,
+        stratify=y_train,
+        random_state=42
+    )
+    model.calibrate_threshold(X_cal, y_cal, metric='f1')
+
+    # Evaluate on held out test
+    results = model.evaluate_performance(
+        X_test,
+        y_test,
+        dataset_name=dataset_type.upper()
+    )
+
+    # Extract approximate hard rules with CART
+    print(f"\n{'='*60}")
+    print("Approximate human readable decision rules (CART surrogate)")
+    print(f"{'='*60}")
+    rule_text = model.extract_decision_tree_rules(
+        feature_names=feature_names,
+        max_depth_display=3
+    )
+
+    # Timing info
+    timing_info = model.get_training_time_report()
+    pipeline_total_time_sec = float(time.time() - experiment_start)
+    timing_info["pipeline_total_time_sec"] = pipeline_total_time_sec
+
+    print("\n" + "="*60)
+    print("Training Time Report")
+    print("="*60)
+    print(f"Mean seconds per epoch: {timing_info['mean_epoch_time_sec']}")
+    print(f"Total training wall time sec: {timing_info['total_training_time_sec']}")
+    print(f"Total pipeline wall time sec: {timing_info['pipeline_total_time_sec']}")
+    print(f"Per epoch times sec: {timing_info['epoch_times']}")
+
+    # Display learned centroids
+    centroid_0, centroid_1 = model.get_centroids()
+    print(f"\n{'='*60}")
+    print("Learned Centroids")
+    print(f"{'='*60}")
+    print(f"Centroid 0 (Normal like cluster): {centroid_0}")
+    print(f"Centroid 1 (Outlier like cluster): {centroid_1}")
+    print("Final centroid separation L2: "
+          f"{np.linalg.norm(centroid_0 - centroid_1):.4f}")
+
+    # Final summary
+    print(f"\n{'='*60}")
+    print(f"Final Results for {dataset_type.upper()}")
+    print(f"{'='*60}")
+    for metric, value in results.items():
+        print(f"{metric.replace('_', ' ').title()}: {value:.4f}")
+
+    if rule_text is not None:
+        print(f"\nCART surrogate rules:\n{rule_text}")
+
+    return model, results, timing_info
+
+
+def compare_datasets(diabetes_results, kdd_results):
+    """
+    Compare performance across datasets
+    """
+    print("\n" + "="*80)
+    print("CROSS DOMAIN VALIDATION: Performance Comparison")
+    print("="*80)
+
+    comparison_df = pd.DataFrame({
+        'Healthcare (Diabetes)': diabetes_results,
+        'Cybersecurity (KDDCup99)': kdd_results
+    }).T
+
+    print("\n", comparison_df)
+
+    # Visualization
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    metrics = list(diabetes_results.keys())
+    x = np.arange(len(metrics))
+    width = 0.35
+
+    diabetes_vals = [diabetes_results[m] for m in metrics]
+    kdd_vals = [kdd_results[m] for m in metrics]
+
+    axes[0].bar(x - width/2, diabetes_vals, width, label='Diabetes', alpha=0.8)
+    axes[0].bar(x + width/2, kdd_vals, width, label='KDDCup99', alpha=0.8)
+    axes[0].set_ylabel('Score', fontsize=12)
+    axes[0].set_title('Performance Metrics Comparison',
+                      fontsize=14, fontweight='bold')
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels(
+        [m.replace('_', '\n').title() for m in metrics],
+        fontsize=9
+    )
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3, axis='y')
+    axes[0].set_ylim([0, 1])
+
+    angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
+    diabetes_vals_radar = diabetes_vals + [diabetes_vals[0]]
+    kdd_vals_radar = kdd_vals + [kdd_vals[0]]
+    angles += angles[:1]
+
+    ax = plt.subplot(122, projection='polar')
+    ax.plot(angles, diabetes_vals_radar, 'o-', linewidth=2, label='Diabetes')
+    ax.fill(angles, diabetes_vals_radar, alpha=0.25)
+    ax.plot(angles, kdd_vals_radar, 'o-', linewidth=2, label='KDDCup99')
+    ax.fill(angles, kdd_vals_radar, alpha=0.25)
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(
+        [m.replace('_', '\n').title() for m in metrics],
+        fontsize=9
+    )
+    ax.set_ylim(0, 1)
+    ax.set_title('Cross Domain Performance',
+                 fontsize=14, fontweight='bold', pad=20)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+    ax.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    print("\n" + "="*60)
+    print("Statistical Summary")
+    print("="*60)
+    print(f"Average Performance - Diabetes: {np.mean(diabetes_vals):.4f}")
+    print(f"Average Performance - KDDCup99: {np.mean(kdd_vals):.4f}")
+    print(f"Performance Variance - Diabetes: {np.var(diabetes_vals):.4f}")
+    print(f"Performance Variance - KDDCup99: {np.var(kdd_vals):.4f}")
+
+    return comparison_df
+
+
+if __name__ == "__main__":
+    print("\n" + "="*80)
+    print("NIOD: Neural Interpretable Outlier Detection Framework")
+    print("Cross Domain Validation Study")
+    print("="*80)
+    print("All random seeds fixed for reproducibility.")
+    print("Centroid distances and rule extraction enabled.")
+    print("Timing per epoch, training runtime and pipeline runtime tracked.")
+    print("="*80)
+
+    # Example 1: Run on KDDCup99 dataset (Network Security Domain)
+    print("\n" + "="*80)
+    print("EXPERIMENT 1: Network Security Domain (KDDCup99)")
+    print("="*80)
+    kdd_model, kdd_results, kdd_timing = run_experiment(dataset_type='kddcup99')
+
+    # Example 2: Run on Diabetes dataset (Healthcare Domain)
+    # To run diabetes you must provide a local CSV path with Outcome column
+    # For example:
+    # diabetes_model, diabetes_results, diabetes_timing = run_experiment(
+    #     dataset_type='diabetes',
+    #     diabetes_path='pima_diabetes.csv'
+    # )
+
+    # Example 3: Compare both datasets (uncomment if both runs are available)
+    # comparison_df = compare_datasets(diabetes_results, kdd_results)
+
+    print("\n" + "="*80)
+    print("Experiment Complete.")
+    print("="*80)
